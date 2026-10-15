@@ -12,7 +12,7 @@ import {
   updateDocumentStatus,
   updateDocumentTotalPages,
   fetchRecentDocuments,
-  loadDocumentPagesMap,
+  loadDocumentPagesResult,
   saveUserPreference,
   isSupabaseConfigured,
   type SavedDocument,
@@ -123,6 +123,10 @@ export default function App() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [recentDocs, setRecentDocs]   = useState<SavedDocument[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  const [isRestoringDoc, setIsRestoringDoc] = useState(false);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+  // Track which doc ID is currently being restored (to prevent double-clicks)
+  const restoringDocIdRef = useRef<string | null>(null);
 
   // Dedicated PDF Export state
   const [showPdfExportModal, setShowPdfExportModal] = useState(false);
@@ -311,19 +315,52 @@ export default function App() {
 
   // ── Restore a Document from Supabase ─────────────────────────────────────────
   const restoreDocument = async (doc: SavedDocument) => {
+    // Prevent duplicate concurrent restores
+    if (isRestoringDoc || restoringDocIdRef.current === doc.id) return;
+    restoringDocIdRef.current = doc.id;
+    setIsRestoringDoc(true);
+    setRestoreError(null);
     setHistoryOpen(false);
     setProcessing(false);
+
+    // Stage 1: Apply document-level metadata immediately so the UI shows the doc
     setIsRestoredSession(true);
     setRestoredDocName(doc.filename);
     setFile(null); // Keep original scan strictly session-scoped / not in storage
-    setIsPDF(doc.file_type.includes('pdf'));
+    const isPdfDoc = doc.file_type.includes('pdf');
+    setIsPDF(isPdfDoc);
     setCurrentDocId(doc.id);
     currentDocIdRef.current = doc.id;
-    setSupabaseSyncMsg(`✓ Restored "${doc.filename}" from Supabase`);
+    // Clear previous content while loading
+    setPagesMap({});
+    setResult(null);
+    setEditedText('');
+    setEditedTranslation('');
+    setEditedHindiTranslation('');
+    setActivePage(1);
+    setSupabaseSyncMsg(`⏳ Loading "${doc.filename}" from Supabase…`);
 
-    const pages = await loadDocumentPagesMap(doc.id);
-    // Stale async response guard
-    if (currentDocIdRef.current !== doc.id) return;
+    // Stage 2: Fetch all page records from Supabase
+    const { pages, totalLoaded, error: loadError } = await loadDocumentPagesResult(doc.id);
+
+    // Stale async response guard — user may have triggered another restore
+    if (currentDocIdRef.current !== doc.id) {
+      restoringDocIdRef.current = null;
+      setIsRestoringDoc(false);
+      return;
+    }
+
+    // Handle query errors
+    if (loadError) {
+      console.warn('[TamilVault] Restore load error for doc', doc.id, ':', loadError);
+      setRestoreError(
+        `Could not load OCR results: ${loadError}. The document metadata was found, but page records could not be retrieved.`
+      );
+      setSupabaseSyncMsg(null);
+      restoringDocIdRef.current = null;
+      setIsRestoringDoc(false);
+      return;
+    }
 
     const pageNums = Object.keys(pages).map(Number);
     const maxPage = Math.max(doc.total_pages || 1, pageNums.length ? Math.max(...pageNums) : 1);
@@ -333,7 +370,8 @@ export default function App() {
       updateDocumentTotalPages(doc.id, maxPage);
     }
 
-    // Build complete contiguous page map 1..maxPage
+    // Build complete contiguous page map 1..maxPage,
+    // filling gaps with pending placeholders (honest — not fake content)
     const fullPagesMap: Record<number, PageData> = {};
     for (let i = 1; i <= maxPage; i++) {
       if (pages[i]) {
@@ -343,44 +381,70 @@ export default function App() {
       }
     }
     setPagesMap(fullPagesMap);
-    setActivePage(1);
 
-    const firstPage = fullPagesMap[1];
-    if (firstPage) {
-      setEditedText(firstPage.tamil_text || firstPage.cleaned_text || '');
-      setEditedTranslation(firstPage.english_translation ?? '');
-      setEditedHindiTranslation(firstPage.hindi_translation ?? '');
-    } else {
-      setEditedText('');
-      setEditedTranslation('');
-      setEditedHindiTranslation('');
+    // Navigate to the first page that has actual saved content,
+    // falling back to page 1 if no page has content
+    let firstContentPage = 1;
+    for (let i = 1; i <= maxPage; i++) {
+      const p = fullPagesMap[i];
+      if (p && (p.status === 'completed' || p.status === 'needs_review') &&
+          (p.tamil_text || p.cleaned_text || p.raw_text || '').trim()) {
+        firstContentPage = i;
+        break;
+      }
+    }
+    setActivePage(firstContentPage);
+
+    const targetPage = fullPagesMap[firstContentPage];
+    if (targetPage) {
+      setEditedText(targetPage.tamil_text || targetPage.cleaned_text || '');
+      setEditedTranslation(targetPage.english_translation ?? '');
+      setEditedHindiTranslation(targetPage.hindi_translation ?? '');
     }
 
-    if (doc.file_type.includes('pdf')) {
+    if (isPdfDoc) {
       setPdfInfo({
         page_count: maxPage,
         has_digital_text: false,
         error: null,
       });
     } else {
+      // Image document — expose page 1 data as the result
+      const imgPage = fullPagesMap[1];
+      const hasContent = Boolean((imgPage?.tamil_text || imgPage?.cleaned_text || imgPage?.raw_text || '').trim());
       setResult({
-        success: doc.status === 'completed',
-        raw_text: firstPage?.raw_text || '',
-        cleaned_text: firstPage?.cleaned_text || '',
-        tamil_text: firstPage?.tamil_text || '',
-        english_translation: firstPage?.english_translation || null,
-        hindi_translation: firstPage?.hindi_translation || null,
+        success: hasContent && (imgPage?.status === 'completed' || imgPage?.status === 'needs_review'),
+        raw_text: imgPage?.raw_text || '',
+        cleaned_text: imgPage?.cleaned_text || '',
+        tamil_text: imgPage?.tamil_text || '',
+        english_translation: imgPage?.english_translation || null,
+        hindi_translation: imgPage?.hindi_translation || null,
         words_with_confidence: [],
         regions_found: 1,
         engine: 'gemini',
-        engine_model: firstPage?.engine_model || '',
+        engine_model: imgPage?.engine_model || '',
         api_key_configured: true,
         language: doc.ocr_language || 'tam+eng',
-        error: firstPage?.error || null,
-        confidence_score: firstPage?.confidence_score,
-        suggested_corrections: firstPage?.suggested_corrections,
+        error: imgPage?.error || null,
+        confidence_score: imgPage?.confidence_score,
+        suggested_corrections: imgPage?.suggested_corrections,
       });
     }
+
+    // Stage 3: Show accurate status only after data is loaded
+    if (totalLoaded === 0) {
+      setSupabaseSyncMsg(
+        `📂 "${doc.filename}" opened — no saved OCR results yet. Upload the original file to run OCR.`
+      );
+    } else {
+      const completedInMap = Object.values(fullPagesMap).filter(p => p.status === 'completed' || p.status === 'needs_review').length;
+      setSupabaseSyncMsg(
+        `✓ Restored "${doc.filename}" — ${completedInMap} of ${maxPage} page${maxPage !== 1 ? 's' : ''} loaded from Supabase`
+      );
+    }
+
+    restoringDocIdRef.current = null;
+    setIsRestoringDoc(false);
   };
 
   // ── Cancel stream ────────────────────────────────────────────────────────────
@@ -1914,13 +1978,52 @@ export default function App() {
               )}
 
               {/* Initial Empty state before any file */}
-              {!file && (
+              {!file && !isRestoredSession && (
                 <div className="empty-state">
                   <div className="empty-icon">📜</div>
                   <p>{t.initialEmptyTitle}</p>
                   <div style={{ marginTop: 16, fontSize: 12, color: 'rgba(255,255,255,0.35)', lineHeight: 1.8 }}>
                     {t.initialEmptySubtitle}
                   </div>
+                </div>
+              )}
+
+              {/* Restore loading indicator */}
+              {isRestoringDoc && (
+                <div className="empty-state">
+                  <div className="spinner" style={{ width: 36, height: 36, borderWidth: 3 }} />
+                  <p style={{ marginTop: 16, fontSize: 14 }}>
+                    Loading saved OCR results…
+                  </p>
+                  <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', marginTop: 4 }}>
+                    Fetching page records from Supabase
+                  </span>
+                </div>
+              )}
+
+              {/* Restore error notice */}
+              {restoreError && !isRestoringDoc && (
+                <div className="alert error" style={{ margin: '16px 20px 0' }}>
+                  <span className="alert-icon">⚠</span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: 600, marginBottom: 4 }}>Could not restore OCR results</div>
+                    <div style={{ fontSize: 12, wordBreak: 'break-word', color: 'rgba(255,255,255,0.8)' }}>
+                      {restoreError}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Restored session with no OCR data — prompt to re-upload */}
+              {!isRestoringDoc && !restoreError && isRestoredSession && !file && Object.keys(pagesMap).length === 0 && !result && (
+                <div style={{ margin: '24px 20px', padding: 24, textAlign: 'center', background: 'rgba(255,255,255,0.02)', borderRadius: 12, border: '1px dashed rgba(255,255,255,0.1)' }}>
+                  <div style={{ fontSize: 32, marginBottom: 12 }}>📂</div>
+                  <h3 style={{ fontSize: 15, marginBottom: 8, color: '#a5b4fc' }}>
+                    Document metadata found
+                  </h3>
+                  <p style={{ fontSize: 12, color: 'rgba(255,255,255,0.5)', maxWidth: 400, margin: '0 auto 16px', lineHeight: 1.6 }}>
+                    No saved OCR results were found for this document. Upload the original file and run OCR to generate results.
+                  </p>
                 </div>
               )}
 
@@ -2165,22 +2268,46 @@ export default function App() {
               ) : (
                 recentDocs.map(doc => (
                   <div key={doc.id} className="doc-item">
-                    <div>
-                      <div style={{ fontWeight: 600, fontSize: 14, color: '#fff' }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontWeight: 600, fontSize: 14, color: '#fff', wordBreak: 'break-word' }}>
                         {doc.filename}
                       </div>
                       <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', marginTop: 4 }}>
                         {fmtBytes(doc.file_size)} · {doc.total_pages} {doc.total_pages > 1 ? 'pages' : 'page'} · {new Date(doc.created_at).toLocaleDateString()}
                       </div>
+                      {/* Saved page count integrity summary */}
+                      {doc.saved_pages_count !== undefined && (
+                        <div style={{
+                          fontSize: 10, marginTop: 3,
+                          color: doc.saved_pages_count === 0
+                            ? 'rgba(245,158,11,0.8)'
+                            : doc.saved_pages_count < doc.total_pages
+                              ? 'rgba(251,191,36,0.7)'
+                              : 'rgba(16,185,129,0.7)',
+                        }}>
+                          {doc.saved_pages_count === 0
+                            ? '⚠ No OCR results saved'
+                            : doc.saved_pages_count < doc.total_pages
+                              ? `⚡ ${doc.saved_pages_count} of ${doc.total_pages} pages saved`
+                              : `✓ All ${doc.total_pages} page${doc.total_pages > 1 ? 's' : ''} saved`}
+                        </div>
+                      )}
                     </div>
                     <button
                       onClick={() => restoreDocument(doc)}
+                      disabled={isRestoringDoc}
                       style={{
-                        background: 'var(--c-primary)', color: '#fff', border: 'none',
-                        borderRadius: 6, padding: '6px 14px', fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                        background: isRestoringDoc ? 'rgba(99,112,255,0.3)' : 'var(--c-primary)',
+                        color: '#fff', border: 'none',
+                        borderRadius: 6, padding: '6px 14px', fontSize: 12, fontWeight: 600,
+                        cursor: isRestoringDoc ? 'not-allowed' : 'pointer',
+                        flexShrink: 0,
+                        display: 'flex', alignItems: 'center', gap: 6,
                       }}
                     >
-                      {t.btnLoadDocument}
+                      {isRestoringDoc && restoringDocIdRef.current === doc.id
+                        ? <><div className="spinner" style={{ width: 10, height: 10, borderWidth: 2 }} /> Loading…</>
+                        : t.btnLoadDocument}
                     </button>
                   </div>
                 ))

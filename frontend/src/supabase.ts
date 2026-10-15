@@ -45,7 +45,11 @@ export interface SavedDocument {
   ocr_language: string;
   created_at: string;
   updated_at: string;
+  saved_pages_count?: number;
 }
+
+// ── Cache for database schema capabilities ────────────────────────────────────
+let cachedSupportsHindiColumn: boolean | null = null;
 
 // ── Document Operations ───────────────────────────────────────────────────────
 
@@ -126,6 +130,7 @@ export async function updateDocumentTotalPages(
 /**
  * Upserts a page record into document_pages.
  * Automatically updates existing page records on retries without duplicating.
+ * Includes graceful retry if the optional 'hindi_translation' column has not been migrated yet.
  */
 export async function upsertDocumentPage(
   documentId: string,
@@ -151,29 +156,51 @@ export async function upsertDocumentPage(
       ? page.suggested_corrections
       : null;
 
-    const { error } = await supabase
-      .from('document_pages')
-      .upsert(
-        {
-          document_id: documentId,
-          page_number: pageNum,
-          status,
-          raw_tamil_text: rawText,
-          cleaned_tamil_text: tamilText,
-          english_translation: translation,
-          hindi_translation: hindiTranslation,
-          suggested_corrections: corrections,
-          confidence_score: confidence,
-          needs_review: needsReview,
-          source,
-          engine_model: model,
-          error_details: errorDetails,
-        },
-        { onConflict: 'document_id, page_number' },
-      );
+    const basePayload: Record<string, any> = {
+      document_id: documentId,
+      page_number: pageNum,
+      status,
+      raw_tamil_text: rawText,
+      cleaned_tamil_text: tamilText,
+      english_translation: translation,
+      suggested_corrections: corrections,
+      confidence_score: confidence,
+      needs_review: needsReview,
+      source,
+      engine_model: model,
+      error_details: errorDetails,
+    };
 
-    if (error) {
-      console.warn(`Supabase upsert page ${pageNum} error:`, error.message);
+    // If schema is known to support hindi_translation (or unverified), try with it
+    if (cachedSupportsHindiColumn !== false && hindiTranslation !== undefined) {
+      const fullPayload = { ...basePayload, hindi_translation: hindiTranslation };
+      const { error } = await supabase
+        .from('document_pages')
+        .upsert(fullPayload, { onConflict: 'document_id, page_number' });
+
+      if (!error) {
+        cachedSupportsHindiColumn = true;
+        return true;
+      }
+
+      // If error indicates column does not exist, cache and fallback without hindi_translation
+      const errMsg = error.message || '';
+      if (errMsg.includes('hindi_translation') || error.code === '42703' || error.code === 'PGRST204') {
+        cachedSupportsHindiColumn = false;
+        console.warn('Supabase: hindi_translation column not present in document_pages table; retrying without it.');
+      } else {
+        console.warn(`Supabase upsert page ${pageNum} error:`, errMsg);
+        return false;
+      }
+    }
+
+    // Upsert without hindi_translation
+    const { error: retryErr } = await supabase
+      .from('document_pages')
+      .upsert(basePayload, { onConflict: 'document_id, page_number' });
+
+    if (retryErr) {
+      console.warn(`Supabase upsert page ${pageNum} retry error:`, retryErr.message);
       return false;
     }
     return true;
@@ -184,14 +211,14 @@ export async function upsertDocumentPage(
 }
 
 /**
- * Fetches recent documents saved in Supabase.
+ * Fetches recent documents saved in Supabase, along with saved OCR page counts.
  */
-export async function fetchRecentDocuments(limit = 15): Promise<SavedDocument[]> {
+export async function fetchRecentDocuments(limit = 20): Promise<SavedDocument[]> {
   if (!supabase) return [];
   try {
     const { data, error } = await supabase
       .from('documents')
-      .select('*')
+      .select('*, document_pages(count)')
       .order('created_at', { ascending: false })
       .limit(limit);
 
@@ -199,20 +226,46 @@ export async function fetchRecentDocuments(limit = 15): Promise<SavedDocument[]>
       console.warn('Supabase fetchRecentDocuments error:', error.message);
       return [];
     }
-    return (data as SavedDocument[]) ?? [];
+
+    return (data || []).map((row: any) => {
+      const pageCountArr = row.document_pages;
+      const count = Array.isArray(pageCountArr) && pageCountArr[0] && typeof pageCountArr[0].count === 'number'
+        ? pageCountArr[0].count
+        : 0;
+      return {
+        id: row.id,
+        filename: row.filename,
+        file_type: row.file_type,
+        file_size: row.file_size,
+        total_pages: row.total_pages,
+        status: row.status,
+        ocr_language: row.ocr_language,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        saved_pages_count: count,
+      };
+    }) as SavedDocument[];
   } catch (err) {
     console.warn('Supabase fetchRecentDocuments exception:', err);
     return [];
   }
 }
 
+export interface LoadPagesResult {
+  pages: Record<number, PageData>;
+  totalLoaded: number;
+  error: string | null;
+}
+
 /**
- * Loads all saved pages for a document and reconstructs the pagesMap.
+ * Loads all saved pages for a document and reconstructs the pagesMap with honest status & integrity.
  */
-export async function loadDocumentPagesMap(
+export async function loadDocumentPagesResult(
   documentId: string,
-): Promise<Record<number, PageData>> {
-  if (!supabase || !documentId) return {};
+): Promise<LoadPagesResult> {
+  if (!supabase || !documentId) {
+    return { pages: {}, totalLoaded: 0, error: 'Database connection unavailable or invalid document ID.' };
+  }
   try {
     const { data, error } = await supabase
       .from('document_pages')
@@ -222,17 +275,35 @@ export async function loadDocumentPagesMap(
 
     if (error) {
       console.warn('Supabase loadDocumentPagesMap error:', error.message);
-      return {};
+      return { pages: {}, totalLoaded: 0, error: error.message };
     }
 
     const map: Record<number, PageData> = {};
     (data || []).forEach(row => {
-      map[row.page_number] = {
-        page_number: row.page_number,
-        status: row.status,
-        raw_text: row.raw_tamil_text || '',
-        cleaned_text: row.cleaned_tamil_text || '',
-        tamil_text: row.cleaned_tamil_text || '',
+      const pageNum = Number(row.page_number);
+      const rawText = row.raw_tamil_text || '';
+      const cleanedText = row.cleaned_tamil_text || '';
+      const tamilText = cleanedText || rawText || '';
+      const hasText = Boolean(tamilText.trim());
+
+      // Honest status resolution matching Requirement 3
+      let computedStatus: 'completed' | 'needs_review' | 'failed' | 'pending' = 'pending';
+      if (row.status === 'failed' || (!hasText && row.error_details)) {
+        computedStatus = 'failed';
+      } else if (row.status === 'needs_review' || row.needs_review || (hasText && tamilText.includes('[unclear]'))) {
+        computedStatus = 'needs_review';
+      } else if (hasText) {
+        computedStatus = 'completed';
+      } else {
+        computedStatus = 'pending';
+      }
+
+      map[pageNum] = {
+        page_number: pageNum,
+        status: computedStatus,
+        raw_text: rawText,
+        cleaned_text: cleanedText,
+        tamil_text: tamilText,
         english_translation: row.english_translation || null,
         hindi_translation: row.hindi_translation || null,
         engine: 'gemini',
@@ -241,17 +312,89 @@ export async function loadDocumentPagesMap(
         source: row.source || 'ocr',
         error: row.error_details || null,
         error_category: null,
-        needs_review: row.needs_review || false,
-        confidence_score: row.confidence_score,
-        suggested_corrections: row.suggested_corrections,
+        needs_review: computedStatus === 'needs_review',
+        confidence_score: row.confidence_score != null ? Number(row.confidence_score) : null,
+        suggested_corrections: row.suggested_corrections || null,
       };
     });
 
-    return map;
-  } catch (err) {
-    console.warn('Supabase loadDocumentPagesMap exception:', err);
-    return {};
+    return {
+      pages: map,
+      totalLoaded: Object.keys(map).length,
+      error: null,
+    };
+  } catch (err: any) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn('Supabase loadDocumentPagesMap exception:', msg);
+    return { pages: {}, totalLoaded: 0, error: msg };
   }
+}
+
+/**
+ * Convenience wrapper returning pages map.
+ */
+export async function loadDocumentPagesMap(
+  documentId: string,
+): Promise<Record<number, PageData>> {
+  const res = await loadDocumentPagesResult(documentId);
+  return res.pages;
+}
+
+// ── Document Integrity Checks ─────────────────────────────────────────────────
+
+export interface DocumentIntegrityStats {
+  totalExpected: number;
+  totalSaved: number;
+  completedCount: number;
+  reviewCount: number;
+  failedCount: number;
+  pendingCount: number;
+  isComplete: boolean;
+  missingPages: number[];
+}
+
+export function computeDocumentIntegrity(
+  totalExpectedPages: number,
+  pagesMap: Record<number, PageData>,
+): DocumentIntegrityStats {
+  const pageNums = Object.keys(pagesMap).map(Number);
+  const maxPage = Math.max(totalExpectedPages || 1, pageNums.length ? Math.max(...pageNums) : 1);
+  let completed = 0;
+  let review = 0;
+  let failed = 0;
+  let pending = 0;
+  let savedWithContent = 0;
+  const missingPages: number[] = [];
+
+  for (let i = 1; i <= maxPage; i++) {
+    const p = pagesMap[i];
+    if (!p) {
+      pending++;
+      missingPages.push(i);
+      continue;
+    }
+    const hasContent = Boolean((p.tamil_text || p.cleaned_text || p.raw_text || '').trim());
+    if (hasContent) savedWithContent++;
+
+    if (p.status === 'completed') completed++;
+    else if (p.status === 'needs_review') review++;
+    else if (p.status === 'failed') failed++;
+    else {
+      pending++;
+      if (!hasContent) missingPages.push(i);
+    }
+  }
+
+  return {
+    totalExpected: maxPage,
+    totalSaved: savedWithContent,
+    completedCount: completed,
+    reviewCount: review,
+    failedCount: failed,
+    pendingCount: pending,
+    isComplete: pending === 0 && savedWithContent > 0,
+    missingPages,
+  };
 }
 
 // ── User Preferences ──────────────────────────────────────────────────────────
